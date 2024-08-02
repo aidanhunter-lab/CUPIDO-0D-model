@@ -1,0 +1,511 @@
+---
+title: "Code Main"
+output: html_document
+date: "2024-02-05"
+---
+R setup - packages
+```{r setup, include=FALSE}
+pkgs <- c("gsw", "tidyverse", "ncdf4", "lubridate", "dplyr", "this.path") # required packages
+for(i in 1:length(pkgs)){
+  # Load packages, installing if necessary
+  j <- library(pkgs[i], character.only = TRUE, logical.return = TRUE)
+  if(!j){
+    install.packages(pkgs[i])
+    library(pkgs[i], character.only = TRUE)}}
+```
+
+Import Data
+```{r}
+setwd(this.dir()) # set working directory
+data.list <- list() # 'list' is a reserved keyword R uses to create lists -- avoid using reserved keywords to define objects
+# list <- list()
+data_files <- list.files(recursive = TRUE)
+data_files <- data_files[grepl('\\.nc', data_files)]
+for(i in 1:length(data_files)){
+  nc_ds <- nc_open(data_files[i])
+  dim_lat <- ncvar_get(nc_ds, "LATITUDE")
+  dim_lon <- ncvar_get(nc_ds, "LONGITUDE")
+  dim_temp <- ncvar_get(nc_ds, "TEMP")
+  dim_psal <- ncvar_get(nc_ds, "PSAL")
+  dim_pres <- ncvar_get(nc_ds, "PRES")
+  dim_time <- ncvar_get(nc_ds, "TIME")
+  
+  dim_depth <- gsw_z_from_p(dim_pres, dim_lat) # calculate depth from pressure and latitude
+  
+  # origin <- as.Date('1950-01-01')
+  origin <- '1950-01-01'
+  sec <- dim_time * 24 * 60 * 60
+  # sec <- dim_time[1] * 24 * 60 * 60
+  dim_time <- as.POSIXct(sec, origin = origin) # convert stored 'time' into actual sample time
+  dim_year <- as.numeric(strftime(dim_time, '%Y'))
+  dim_month <- as.numeric(strftime(dim_time, '%m'))
+  dim_day <- as.numeric(strftime(dim_time, '%d'))
+  
+  j <- which.min(apply(dim_depth, 2, function(z) min(z, na.rm = TRUE)))
+  
+  # name the variables for clarity, rather than using X1, X2 etc
+  tesa <- data.frame(depth = dim_depth[,j], psal = dim_psal[,j], temp = dim_temp[,j], pres = dim_pres[,j])
+  # tesa <- data.frame(cbind(dim_psal[,j], dim_temp[,j], dim_pres[,j]))
+  tesa
+  
+  # Can combine new variables within a single call of 'mutate'
+  tesa <- tesa %>% mutate(lon = dim_lon[j],
+                          lat = dim_lat[j],
+                          year = dim_year[j],
+                          month = dim_month[j],
+                          day = dim_day[j]
+  )
+  data.list[[i]] <- tesa
+}
+
+# Include a sample index in each list element
+data.list <- lapply(1:length(data.list), function(z){
+  x <- data.list[[z]]
+  x$sample <- z
+  x})
+
+
+data.list
+new.data <- do.call('rbind', data.list)
+summary(na.omit(new.data$lat))
+
+
+new.data$asal <- gsw_SA_from_SP(new.data$psal, p = new.data$pres,
+                                longitude = new.data$lon, latitude = new.data$lat)
+# Calculate seawater density
+new.data$rho <- gsw_rho(SA = new.data$asal, CT = new.data$temp, p = new.data$pres)
+new.data$rho <- new.data$rho / 1000 # convert units to g/cm^3
+# we can convert back to a list, but it's probably easier to work with the data
+# frame, using the sample index column to differentiate samples.
+data.list <- lapply(unique(new.data$sample), function(z){
+  new.data[new.data$sample == z,]})
+
+#for(i in unique(new.data$sample)){
+  #d <- new.data[new.data$sample == i,]
+  #Title <- paste(d$day[1], month.abb[d$month[1]], d$year[1])
+  #plot(d$rho, d$depth, xlab = expression(sewater ~ density ~ (g/cm^3)),
+  #     ylab = 'depth (m)', main = Title)
+#}
+```
+Not entirely sure what is wrong with the above code. It works just fine in a normal
+R script, but returns an error when run through R Markdown. There are no other
+issues running the rest of the Markdown script.
+
+Interpolate density by depth
+```{r}
+# Average the density-at-depth measurements across samples within months. The depths
+# may not line up, so first create smooth interpolating functions to find density
+# at the same depths in every sample. Then create a smooth interpolating function
+# that returns density-at-depth for each month (this is needed for our equations).
+new.data$depth <- new.data$depth * 100 # convert units of depth to cm (our interpolating functions are used within the sinking speed equations which use g-cm-s units)
+months <- unique(new.data$month)
+nmonths <- length(months)
+depth.range <- data.frame(min = rep(NA, nmonths), max = rep(NA, nmonths), month = months) # store range of sampled depths for each month
+rho.interp <- setNames(vector(mode = 'list', length = nmonths), month.abb[months]) # store interpolating function for each month
+for(i in 1:nmonths){
+  d <- new.data[new.data$month == months[i],] # subset data for month i
+  samples <- unique(d$sample) # sample indices for month i
+  nsamples <- length(samples)
+  dr <- sapply(samples, function(z){ # depth range of each sample
+    x <- d[d$sample == z,]
+    range(x$depth, na.rm = TRUE)})
+  dr <- c(ceiling(min(dr[2,])), floor(max(dr[1,]))) # a depth range for month i  
+  depth.range[depth.range$month == months[i], c('min','max')] <- dr
+  depth.inc <- seq(dr[1], dr[2], -10) # uniform depth increments [cm] to feed into interpolating functions
+  ndepth <- length(depth.inc)
+  rho.matrix <- matrix(NA, ndepth, nsamples) # store interpolated densities for each sample
+  for(j in 1:nsamples){
+    dj <- d[d$sample == samples[j],] # subset data for sample j in month i
+    f <- approxfun(dj$depth, dj$rho)
+    rho.matrix[,j] <- f(depth.inc) # interpolate
+  }
+  rho <- rowMeans(rho.matrix, na.rm = TRUE) # average density (at depths depth.inc) across samples
+  rho.interp[[i]] <- approxfun(depth.inc, rho, rule = 2) # create and store a single interpolating function for density-at-depth per month
+}
+```
+
+Define average fecal pellet parameters and mathematical constants
+```{r}
+# Set up a numerical integration of the sinking & degradation equations.
+# Choose a time step. The value matters -- there is a trade off between accuracy
+# and time taken to solve the equations. A small time step will provide more
+# accurate answers, but take longer (this can be 'dialed-in' later).
+dt <- 10 * 60 # 10 minute time step [s]
+# Set parameter values (in correct units)
+L.init <- 0.2927 # initial length [cm]
+D.init <- 0.0183 # initial diameter [cm]
+gd <- 1.121 # faecal pellet density [g/cm^3]
+# rD <- 1.2 / 86400 # degradation rate [1/s]
+vis <- 0.0189 # seawater viscosity []
+coef <- 0.0790 # scaling coefficient from Komar
+g <- 981 # acceleration due to gravity [cm/s^2]
+p <- -1.644 # power term [dimensionless] from Komar
+# We know faecal pellet decay rates at two specific depths from Morata
+rD_13 <- 0.07 / 86400 # degradation rate [1/s] at chlorophyll max (13 m)
+rD_90 <- 0.02 / 86400 # degradation rate [1/s] at 90 m
+# Convert decay rates into the Martin curve parameters
+rD_b <- log(rD_90 / rD_13) / log(1300 / 9000) # power term [dimensionless]
+rD_a <- rD_13 * 1300 ^ rD_b # coefficient [cm/s]: equivalently expressed as rD_a <- rD_90 * 9000 ^ pow
+
+# Fragmentation rate of faecal pellets. Don't yet know a realistic value.
+# This simple representation of fragmentation rate should be extended to account for
+# faecal pellet size and extent of plastic contamination.
+rF <- 0.05 / 86400 # fragmentation rate [1/s] ()
+
+```
+
+Functions
+```{r}
+source('volume function.R') # loads volume_fun
+# volume <- function(L,D){
+#   pi / 4 * L * D^2}
+mass <- function(V, gd){
+  V * gd}
+shape <- function(L, D){
+  L / D}
+
+# mass.degrade <- function(t, r, m0 = m.init){
+#   # This function models faecal pellets degrading at a constant rate determined by rD.
+#   # This is an unrealistic assumption because rD changes with depth.
+#   # Given the initial mass and rD, this function outputs mass at any time t.
+#   m0 * exp(-r * t)}
+
+rD_fun <- function(z, a = rD_a, b = rD_b){
+  # Degradation rate [1/s] as a function of depth.
+  # Martin curve (is just an exponential decay with depth)
+  a * z ^ -b
+}
+
+speed <- function(m, rhoF, rhoW, visc = vis, 
+                  grav = g, pow = p, const = coef, s = S){
+  const / visc * {rhoF - rhoW} * grav * s^pow * 
+    {{{4 * s^2} / {pi * rhoF}} * m}^{2/3}
+}
+
+Euler <- function(initial.vals, FPDen, rhoW.at.depth, max.depth = -200000,
+                  print.progress = FALSE, convert.units = TRUE){
+  #-----------------------------------------------------------------------------
+  # Solve equations defining faecal pellet sinking/degradation by integrating with
+  # the forward Euler method.
+  # Inputs - initial.vals: dataframe defined by User
+  #          FPDen: density of fecal pellet
+  #          rhoW.at.depth: function defining seawater density continuously over depth
+  #          max.depth: depth limit of integration, seafloor or sample depth
+  #-----------------------------------------------------------------------------
+  output <- initial.vals
+  stopLoop <- FALSE # TRUE stops the while loop
+  t <- 0 # time [s]
+  j <- 0 # iteration counter
+  while(!stopLoop){
+    t <- t + dt # each loop iteration steps forward one time increment
+    j <- j + 1
+    distance <- output$speed[j] * dt # distance [cm] traveled in time dt
+    depth <- output$depth[j] - distance # new depth
+    rD <- rD_fun(-depth) # degradation rate over time step
+    mass.loss <- rD * output$mass.total[j] * dt # mass lost (from all faecal pellets) in time dt
+    M <- output$mass.total[j] - mass.loss # new mass of all faecal pellets
+    new.fragments <- rF * output$number[j] * dt # number of new pieces from fragmentation in time dt
+    N <- output$number[j] + new.fragments # new number of faecal pellets
+    m <- M / N # mass of individual faecal pellet
+    V <- m / FPDen # new volume -- we don't need this to solve the equations, but it may be useful once plastics are considered...
+    rho.W <- rhoW.at.depth(depth) # seawater density
+    sp <- speed(m, FPDen, rho.W) # updated speed
+    output[j+1,] <- data.frame(time = t, depth = depth, number = N, mass.total = M, volume = V, mass = m, speed = sp, rD = rD)
+    # Conditions for breaking out of the while loop...
+    depth.range.exceeded <- output$depth[j+1] < max.depth # has pellet descended below depth limit of measurements?
+    too.slow <- output$speed[j+1] * 86400 < 1 # is pellet moving so slow that it's effectively stationary? (I've chosen 1 cm/day, but this can be changed).
+    if(depth.range.exceeded | too.slow) stopLoop <- TRUE
+    if(print.progress) print(paste0('iteration ', j))
+  }
+  #----------------------
+  # Integration complete
+  #----------------------
+  #----------------------
+  # Convert units from g-cm-s into something more easily readable
+  if(convert.units){
+    output$time <- output$time / 86400 # [day]
+    output$depth <- output$depth / 100 # [m]
+    output$volume <- output$volume * 1000 # [mm^3]
+    output$mass <- output$mass * 1000 # [mg]
+    output$speed <- output$speed * 864 # [m/day]
+    output$rD <- output$rD * 86400 # [1/day]
+  }
+  return(output)
+}
+```
+
+Data for average uncontaminated FP (Nov-Feb)
+```{r, include=FALSE}
+V.init <- volume_fun(L.init, D.init, shape = 'cylinder') # initial volume [cm^3]
+m.init <- mass(V.init, gd) # initial mass [g]
+S <- shape(L.init, D.init) # shape parameter describing faecal pellets, assumed constant [unitless]
+
+depth.init <- sapply(1:nmonths, function(z) depth.range$min[z]) # initial depths [cm], one for each month, depend on depth range of samples
+rhoW.init <- sapply(1:nmonths, function(z) rho.interp[[z]](depth.init[z])) # initial seawater density
+
+sp.init <- speed(m.init, gd, rhoW.init) # initial speed [cm/s]
+
+rD.init <- rD_fun(-depth.init)
+
+N.init <- 1 # initial number of faecal pellets
+M.init <- m.init * N.init # initial mass of faecal pellets combined
+
+# Create list of data frames to store output for each month, and populate with initial values
+initial.vals <- setNames(lapply(1:nmonths, function(z){
+  data.frame(time = 0, depth = depth.init[z], number = N.init, mass.total = M.init,
+             volume = V.init, mass = m.init, speed = sp.init[z], rD = rD.init[z])}),
+  month.abb[months])
+
+# Call the integrating function to generate output for each month
+outputNorm <- lapply(months, function(z){
+  mon <- month.abb[z]
+  rhoW.at.depth <- rho.interp[[mon]]
+  max.depth <- depth.range$max[depth.range$month == z]
+  out <- Euler(initial.vals[[mon]], gd, rhoW.at.depth, max.depth)
+  out <- cbind(month = mon, out)
+  return(out)
+})
+
+```
+
+^^^
+```{r}
+# View results
+i <- 1
+rbind(head(outputNorm[[i]], 5),
+      tail(outputNorm[[i]], 5))
+
+plot(outputNorm[[i]]$time, outputNorm[[i]]$depth, type = 'l',
+     xlab = 'time (days)', ylab = 'depth (m)')
+plot(outputNorm[[i]]$number, outputNorm[[i]]$depth, type = 'l',
+     xlab = expression(number ~ of ~ faecal ~ pellets), ylab = 'depth (m)', log = 'x')
+plot(outputNorm[[i]]$mass, outputNorm[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ mass ~ (mg)), ylab = 'depth (m)')
+plot(outputNorm[[i]]$mass.total, outputNorm[[i]]$depth, type = 'l',
+     xlab = expression(total ~ mass ~ (mg)), ylab = 'depth (m)')
+plot(outputNorm[[i]]$speed, outputNorm[[i]]$depth, type = 'l',
+     xlab = 'sinking speed (m/day)', ylab = 'depth (m)')
+plot(outputNorm[[i]]$volume, outputNorm[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ volume ~ (mm^3)), ylab = 'depth (m)')
+
+# mtext(month.name[months[i]], outer = TRUE, line = -1.5)
+
+
+
+```
+
+Function for calculating mass of MP contaminated FP
+```{r}
+# Function for calculating mass of MP contaminated FP
+# Inputs - nMP: # of MP particles
+# fibRatio: proportion MP that are fibers (assuming other MPs are all fragments)
+# fibV: Volume of fiber
+# fragV: Volume of fragment
+# FPVol: Initial volume of FP
+# FPDens: Density of uncontamintaed FP
+# polyrats: User-defined DF of plastic properties and proportions
+FPMass.2 <- function(nMP, fibRatio, fibV, fragV, FPVol, FPDens, polyrats){
+  fibK <- fibRatio * nMP
+  fragK <- (1 - fibRatio) * nMP
+  MPVol <-  (fibK * fibV) + (fragK * fragV)
+  ratio <- MPVol/FPVol
+  Ovrll <- sum(polyrats$plymrs * polyrats$ratios) # average polymer density
+  Fd <- (FPDens * (1-ratio)) + (Ovrll * ratio)
+  FP.init <- mass(FPVol, Fd)
+  return(c(mass = FP.init, density = Fd)) # Best practice is to define function output
+}
+
+# Same function as previous, but polyrats is substituted for a known density
+FPMass.3 <- function(nMP, fibRatio, fibV, fragV, FPVol, FPDens, PolyDens){
+  fibK <- fibRatio * nMP
+  fragK <- (1 - fibRatio) * nMP
+  MPVol <-  (fibK * fibV) + (fragK * fragV)
+  ratio <- MPVol/FPVol
+  Fd <- (FPDens * (1-ratio)) + (PolyDens * ratio)
+  FP.init <- mass(FPVol, Fd)
+  return(c(mass = FP.init, density = Fd)) # Best practice is to define function output
+}
+```
+
+^^^
+```{r, include=FALSE}
+# Get MP fiber and fragment volumes
+fib <- volume_fun(0.013, 0.003, plastic.type = 'fibre') # WHERE ARE THESE NUMBERS COMING FROM? INCLUDE SOURCE IN THE COMMENTS. ENSURE THE UNITS ARE IN cm.
+frag <- volume_fun(0.002, 0.00142, plastic.type = 'fragment')
+
+# create df with polymer density properties and proportions
+polyrats <- data.frame(name = c("PA6", "HDPE", "VTE", "PBR"),
+                       plymrs = c(1.14,0.95,0.93,0.9),
+                       ratios = c(0.55,0.18,0.17,0.1))
+
+FPMass <- FPMass.2(2.13, 0.82, fib, frag, V.init, gd, polyrats)
+
+# sp.init <- speed(FPMass[1], FPMass[2], rhoW.init) # initial speed [cm/s]
+sp.init <- speed(FPMass['mass'], FPMass['density'], rhoW.init) # initial speed [cm/s]
+
+M.init <- FPMass['mass'] * N.init
+
+# Create list of data frames to store output for each month, and populate with initial values
+initial.vals <- setNames(lapply(1:nmonths, function(z){
+  data.frame(time = 0, depth = depth.init[z], number = N.init, mass.total = M.init, volume = V.init, mass = FPMass['mass'], speed = sp.init[z], rD = rD.init[z])}),
+  month.abb[months])
+
+outputMP <- lapply(months, function(z){
+  mon <- month.abb[z]
+  rhoW.at.depth <- rho.interp[[mon]]
+  max.depth <- depth.range$max[depth.range$month == z]
+  out <- Euler(initial.vals[[mon]], FPMass['density'], rhoW.at.depth, max.depth)
+  out <- cbind(month = mon, out)
+  return(out)
+})
+
+```
+
+^^^
+```{r}
+i <- 1
+rbind(head(outputMP[[i]], 5),
+      tail(outputMP[[i]], 5))
+
+plot(outputMP[[i]]$time, outputMP[[i]]$depth, type = 'l',
+     xlab = 'time (days)', ylab = 'depth (m)')
+plot(outputMP[[i]]$mass, outputMP[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ mass ~ (mg)), ylab = 'depth (m)')
+plot(outputMP[[i]]$speed, outputMP[[i]]$depth, type = 'l',
+     xlab = 'sinking speed (m/day)', ylab = 'depth (m)')
+plot(outputMP[[i]]$volume, outputMP[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ volume ~ (mm^3)), ylab = 'depth (m)')
+mtext(month.name[months[i]], outer = TRUE, line = -1.5)
+```
+
+MP 2050 scenario
+```{r, include=FALSE}
+# Get MP fiber and fragment volumes
+fib <- volume(0.013, 0.003)
+frag <- volume(0.002,0.00142)
+
+# create df with polymer density properties and proportions
+polyrats <- data.frame(name = c("PA6", "HDPE", "VTE", "PBR"),
+                       plymrs = c(1.14,0.95,0.93,0.9),
+                       ratios = c(0.55,0.18,0.17,0.1))
+
+FPMass <- FPMass.2(8.52, 0.82, fib, frag, V.init, gd, polyrats)
+
+sp.init <- speed(FPMass['mass'], FPMass['density'], rhoW.init) # initial speed [cm/s]
+
+# Create list of data frames to store output for each month, and populate with initial values
+output <- setNames(lapply(1:nmonths, function(z){
+  data.frame(time = 0, depth = depth.init[z], volume = V.init, mass = FPMass['mass'], speed = sp.init[z], rD = rD.init[z])}),
+  month.abb[months])
+
+outputMP2 <- Euler(output, FPMass['density'])
+```
+
+```{r}
+i <- 1
+rbind(head(outputMP2[[i]], 5),
+      tail(outputMP2[[i]], 5))
+
+plot(outputMP2[[i]]$time, outputMP2[[i]]$depth, type = 'l',
+     xlab = 'time (days)', ylab = 'depth (m)')
+plot(outputMP2[[i]]$mass, outputMP2[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ mass ~ (mg)), ylab = 'depth (m)')
+plot(outputMP2[[i]]$speed, outputMP2[[i]]$depth, type = 'l',
+     xlab = 'sinking speed (m/day)', ylab = 'depth (m)')
+plot(outputMP2[[i]]$volume, outputMP2[[i]]$depth, type = 'l',
+     xlab = expression(faecal ~ pellet ~ volume ~ (mm^3)), ylab = 'depth (m)')
+mtext(month.name[months[i]], outer = TRUE, line = -1.5)
+```
+
+```{r}
+tail(outputNorm[[1]])
+tail(outputMP[[1]])
+tail(outputMP2[[1]])
+```
+
+```{r}
+# Set sequences for plastic concentration (# of pieces per individual) and 
+# plastic density (overall density of all plastic polymers)
+polCon <- seq(0,100,1)
+polDen <- seq(0.9,1.15,0.01)
+
+# Set test values in quantile proportions
+polCon2 <- as.vector(c(quantile(polCon, 0.25), quantile(polCon, 0.5), quantile(polCon, 0.75), quantile(polCon, 1))) # quartiles without 0
+polDen2 <- as.vector(c(quantile(polDen, 0), quantile(polDen, 0.33), quantile(polDen, 0.66), quantile(polDen, 1))) # in thirds
+
+# All combination
+ConDen2 <- expand.grid(pCon = polCon2, pDen = polDen2)
+```
+
+```{r}
+# line defaults to "ragged" despite "shape" being reset in code
+# fib2 <- volume_fun(130,plastic.type = 'fibre')
+# volume of fragment based on L, W and A
+frag2 <- suppressWarnings(volume_fun(20,14.2, 284))
+frag2 <- frag2 * 10^-12 # convert from micron^3 to cm^3
+
+outputAll <- list()
+par(mfrow=c(2,2))
+for(i in 1:nrow(ConDen2)){
+  FPMass <- FPMass.3(ConDen2$pCon[i], 0.82, fib, frag2, V.init, gd, ConDen2$pDen[i])
+  sp.init <- speed(FPMass['mass'], FPMass['density'], rhoW.init) # initial speed [cm/s]
+  
+  output <- setNames(lapply(1:nmonths, function(z){
+    data.frame(time = 0, depth = depth.init[z], volume = V.init, mass = FPMass['mass'], speed = sp.init[z], rD = rD.init[z], month = months[z])}), month.abb[months])
+  
+  outputMain <- Euler(output, FPMass['density'])
+  new.Main <- do.call('rbind', outputMain)
+  new.Main <- new.Main %>% mutate(PolyDen = as.factor(ConDen2$pDen[i]), PolyCon = as.factor(ConDen2$pCon[i]))
+  outputAll[[i]] <- new.Main
+}
+```
+Base R plots
+```{r}
+m <- 11 # designate month to pull data from
+par(mfrow=c(2,2))
+for(i in 1:length(outputAll)){
+  plot(depth ~ time, data = subset(outputAll[[i]], month == m), type = 'l',
+       xlab = 'time (days)', ylab = 'depth (m)')
+}
+
+for(i in 1:length(outputAll)){
+ plot(depth ~ mass, data = subset(outputAll[[i]], month == m), type = 'l',
+    xlab = expression(faecal ~ pellet ~ mass ~ (mg)), ylab = 'depth (m)')
+}
+
+for(i in 1:length(outputAll)){
+  plot(depth ~ speed, data = subset(outputAll[[i]], month == m), type = 'l',
+       xlab = 'sinking speed (m/day)', ylab = 'depth (m)')
+}
+
+for(i in 1:length(outputAll)){
+  plot(depth ~ volume, data = subset(outputAll[[i]], month == m), type = 'l',
+       xlab = expression(faecal ~ pellet ~ volume ~ (mm^3)), ylab = 'depth (m)')
+}
+```
+
+```{r}
+# set limits for DF in list
+k <- 1
+l <- 4 # chose 4 for polDen and polCon vector lengths (thus possible combinations)
+APPA <- list()
+# for loop combines DFs in groups of 4, to reflect possible combinations
+for(i in 1:4){
+  new.All <- do.call('rbind', outputAll[k:l])
+  APPA[[i]] <- new.All
+  k <- k + 4
+  l <- l + 4
+}
+tail(APPA[[3]])
+```
+```{r}
+m <- 11 # designate month to pull data from
+MonthDat <- subset(APPA[[1]], month == m)
+
+# Plot ranges togeter by plastic concentration
+ggplot(MonthDat, aes(time, depth, color = PolyCon)) + geom_line()
+ggplot(MonthDat, aes(mass, depth, color = PolyCon)) + geom_line()
+ggplot(MonthDat, aes(volume, depth, color = PolyCon)) + geom_line()
+ggplot(MonthDat, aes(speed, depth, color = PolyCon)) + geom_line()
+```
+
